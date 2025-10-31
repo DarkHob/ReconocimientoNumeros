@@ -1,34 +1,27 @@
-from __future__ import annotations
+from __future__ import absolute_import, division, print_function, unicode_literals
 import os
-import sys
 import numpy as np
 import cv2
+import tkinter as tk
+from tkinter import ttk
+from PIL import Image, ImageTk, ImageDraw
+
 import pyttsx3
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-from PyQt6 import QtCore, QtGui, QtWidgets
-
-MODEL_PATH = "mnist_cnn.keras"
+MODEL_PATH = "mnist_mlp.keras"
 BATCHSIZE = 32
-EPOCHS = 10
+EPOCHS = 5
 CLASS_NAMES = [str(i) for i in range(10)]
 
 # ================== MODELO ==================
 
 def build_model():
-    # Modelo CNN: muchas más conexiones (pesos) que una MLP simple
     model = tf.keras.Sequential([
-        tf.keras.layers.Conv2D(32, (3,3), activation='relu', input_shape=(28,28,1)),
-        tf.keras.layers.MaxPooling2D(2,2),
-
-        tf.keras.layers.Conv2D(64, (3,3), activation='relu'),
-        tf.keras.layers.MaxPooling2D(2,2),
-
-        tf.keras.layers.Conv2D(128, (3,3), activation='relu'),
-        tf.keras.layers.Flatten(),
+        tf.keras.layers.Flatten(input_shape=(28,28,1)),
         tf.keras.layers.Dense(128, activation='relu'),
-        tf.keras.layers.Dropout(0.3),
+        tf.keras.layers.Dense(64, activation='relu'),
         tf.keras.layers.Dense(10, activation='softmax')
     ])
     model.compile(optimizer='adam',
@@ -53,17 +46,14 @@ def train_or_load_model():
     test_ds  = test_ds.map(normalize).batch(BATCHSIZE).prefetch(tf.data.AUTOTUNE)
 
     model = build_model()
-    # EarlyStopping para evitar sobreentrenamiento y ModelCheckpoint para guardar el mejor
-    es = tf.keras.callbacks.EarlyStopping(patience=2, restore_best_weights=True, monitor='val_accuracy')
-    ck = tf.keras.callbacks.ModelCheckpoint(MODEL_PATH, save_best_only=True, monitor='val_accuracy')
-    model.fit(train_ds, epochs=EPOCHS, validation_data=test_ds, callbacks=[es, ck], verbose=1)
+    model.fit(train_ds, epochs=EPOCHS, verbose=1)
     test_loss, test_acc = model.evaluate(test_ds, verbose=0)
     print(f"Accuracy en test: {test_acc:.4f}")
     model.save(MODEL_PATH)
     print(f"Modelo guardado en {MODEL_PATH}")
     return model
 
-def speak(text: str):
+def speak(text):
     try:
         engine = pyttsx3.init()
         engine.say(text)
@@ -73,7 +63,7 @@ def speak(text: str):
 
 # ================== PREPROCESADO ==================
 
-def preprocess_digit_bgr(frame_bgr: np.ndarray) -> np.ndarray:
+def preprocess_digit_bgr(frame_bgr):
     """
     Prepara una captura BGR (OpenCV) a formato MNIST: (28,28,1) float32 en [0,1].
     Busca contorno principal, centra, hace cuadrado, reescala y ajusta contraste/inversión.
@@ -91,6 +81,7 @@ def preprocess_digit_bgr(frame_bgr: np.ndarray) -> np.ndarray:
     else:
         digit = gray
 
+    # cuadrado con padding blanco
     h, w = digit.shape
     side = max(h, w)
     square = np.full((side, side), 255, dtype=np.uint8)
@@ -100,7 +91,8 @@ def preprocess_digit_bgr(frame_bgr: np.ndarray) -> np.ndarray:
 
     resized = cv2.resize(square, (28,28), interpolation=cv2.INTER_AREA)
 
-    # Si la media es alta, invertimos (MNIST: dígito claro sobre fondo oscuro)
+    # Inversión: MNIST tiene dígito claro sobre fondo oscuro.
+    # Si la media es alta, invertimos.
     if resized.mean() > 127:
         resized = 255 - resized
 
@@ -108,139 +100,118 @@ def preprocess_digit_bgr(frame_bgr: np.ndarray) -> np.ndarray:
     img = np.expand_dims(img, axis=-1)
     return img
 
-# ================== WIDGETS PERSONALIZADOS ==================
+def preprocess_digit_pil(pil_img):
+    """
+    Toma una imagen PIL (del lienzo de dibujo), la convierte a formato MNIST.
+    Asumimos lienzo blanco y trazos negros.
+    """
+    img = pil_img.convert("L")  # gris
+    # invertir a fondo oscuro, trazo claro
+    inv = Image.eval(img, lambda p: 255 - p)
+    inv = inv.resize((28,28), Image.Resampling.LANCZOS)
+    arr = np.array(inv).astype(np.float32) / 255.0
+    arr = np.expand_dims(arr, axis=-1)
+    return arr
 
-class PaintCanvas(QtWidgets.QLabel):
-    def __init__(self, size=280, brush=18, parent=None):
-        super().__init__(parent)
-        self.setFixedSize(size, size)
-        self.pixmap_obj = QtGui.QPixmap(size, size)
-        self.pixmap_obj.fill(QtGui.QColor('white'))
-        self.setPixmap(self.pixmap_obj)
-        self.last_pos = None
-        self.brush = brush
-        self.pen_color = QtGui.QColor('black')
-        self.setCursor(QtCore.Qt.CursorShape.CrossCursor)
+# ================== APP ==================
 
-    def mousePressEvent(self, e: QtGui.QMouseEvent):
-        self.last_pos = e.position().toPoint()
-        self._draw_point(self.last_pos)
+class DigitApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Reconocimiento de Dígitos - Cámara y Dibujo")
+        self.model = train_or_load_model()
 
-    def mouseMoveEvent(self, e: QtGui.QMouseEvent):
-        if self.last_pos is None:
-            return
-        current = e.position().toPoint()
-        painter = QtGui.QPainter(self.pixmap_obj)
-        pen = QtGui.QPen(self.pen_color, self.brush, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap)
-        painter.setPen(pen)
-        painter.drawLine(self.last_pos, current)
-        painter.end()
-        self.last_pos = current
-        self.setPixmap(self.pixmap_obj)
-        self.update()
+        self.notebook = ttk.Notebook(root)
+        self.frame_cam = ttk.Frame(self.notebook)
+        self.frame_draw = ttk.Frame(self.notebook)
+        self.notebook.add(self.frame_cam, text="Cámara")
+        self.notebook.add(self.frame_draw, text="Dibujar")
+        self.notebook.pack(fill="both", expand=True)
 
-    def mouseReleaseEvent(self, e: QtGui.QMouseEvent):
-        self.last_pos = None
-
-    def _draw_point(self, pos: QtCore.QPoint):
-        painter = QtGui.QPainter(self.pixmap_obj)
-        pen = QtGui.QPen(self.pen_color, self.brush, QtCore.Qt.PenStyle.SolidLine, QtCore.Qt.PenCapStyle.RoundCap)
-        painter.setPen(pen)
-        painter.drawPoint(pos)
-        painter.end()
-        self.setPixmap(self.pixmap_obj)
-        self.update()
-
-    def clear(self):
-        self.pixmap_obj.fill(QtGui.QColor('white'))
-        self.setPixmap(self.pixmap_obj)
-        self.update()
-
-    def to_mnist_array(self) -> np.ndarray:
-        # Convertir a imagen en escala de grises y a numpy, respetando bytesPerLine
-        qimg = self.pixmap_obj.toImage().convertToFormat(QtGui.QImage.Format.Format_Grayscale8)
-        h = qimg.height()
-        w = qimg.width()
-        bpl = qimg.bytesPerLine()
-        ptr = qimg.bits()
-        ptr.setsize(h * bpl)
-        arr = np.frombuffer(ptr, np.uint8).reshape((h, bpl))[:, :w]
-        # Invertir para MNIST (dígito claro sobre fondo oscuro)
-        arr = 255 - arr
-        arr = cv2.resize(arr, (28,28), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
-        arr = np.expand_dims(arr, axis=-1)
-        return arr
-
-# ================== TABS ==================
-
-class CameraTab(QtWidgets.QWidget):
-    def __init__(self, model: tf.keras.Model, parent=None):
-        super().__init__(parent)
-        self.model = model
-        self.video_label = QtWidgets.QLabel()
-        self.video_label.setMinimumSize(640, 480)
-        self.video_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.result_label = QtWidgets.QLabel("Coloca el dígito dentro del recuadro y presiona Capturar")
-        self.result_label.setProperty("class", "lead")
-
-        self.capture_btn = QtWidgets.QPushButton("Capturar (ROI)")
-        self.capture_btn.setProperty("variant", "primary")
-        self.capture_btn.clicked.connect(self.capture_and_predict)
-
-        layout = QtWidgets.QVBoxLayout(self)
-        card = self._make_card([self.video_label])
-        layout.addWidget(card)
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.addWidget(self.capture_btn)
-        btn_row.addStretch(1)
-        layout.addLayout(btn_row)
-        layout.addWidget(self.result_label)
-
+        # ---------- Cámara + ROI ----------
         self.cap = cv2.VideoCapture(0)
         if not self.cap.isOpened():
             raise RuntimeError("No se pudo abrir la cámara (VideoCapture(0)).")
 
-        self.timer = QtCore.QTimer(self)
-        self.timer.timeout.connect(self.update_frame)
-        self.timer.start(15)
+        self.video_label = tk.Label(self.frame_cam)
+        self.video_label.pack(padx=10, pady=10)
 
+        cam_controls = ttk.Frame(self.frame_cam)
+        cam_controls.pack(padx=10, pady=5, fill="x")
+        self.capture_btn = ttk.Button(cam_controls, text="Capturar (ROI)", command=self.capture_and_predict_roi)
+        self.capture_btn.pack(side="left", padx=5)
+
+        self.result_var_cam = tk.StringVar(value="Esperando captura...")
+        self.result_label_cam = ttk.Label(self.frame_cam, textvariable=self.result_var_cam, font=("Arial", 14))
+        self.result_label_cam.pack(pady=5)
+
+        self.running = True
         self.last_frame = None
-        self.roi_rect = None  # x1,y1,x2,y2 en coords del frame
+        self.roi_rect = None  # (x1,y1,x2,y2) en coordenadas del frame
+        self.update_frame()
 
-    def _make_card(self, widgets: list[QtWidgets.QWidget]) -> QtWidgets.QFrame:
-        card = QtWidgets.QFrame()
-        card.setProperty("class", "card")
-        v = QtWidgets.QVBoxLayout(card)
-        for w in widgets:
-            v.addWidget(w)
-        return card
+        # ---------- Lienzo de dibujo ----------
+        self.canvas_size = 280  # 10x MNIST para facilidad
+        self.brush = 16         # grosor del trazo
+        self.canvas = tk.Canvas(self.frame_draw, width=self.canvas_size, height=self.canvas_size, bg="white", cursor="pencil")
+        self.canvas.pack(padx=10, pady=10)
 
+        # Imagen PIL donde “pintamos” para poder exportar
+        self.canvas_image = Image.new("RGB", (self.canvas_size, self.canvas_size), "white")
+        self.canvas_draw = ImageDraw.Draw(self.canvas_image)
+
+        draw_controls = ttk.Frame(self.frame_draw)
+        draw_controls.pack(padx=10, pady=5, fill="x")
+
+        self.predict_draw_btn = ttk.Button(draw_controls, text="Predecir dibujo", command=self.predict_from_canvas)
+        self.predict_draw_btn.pack(side="left", padx=5)
+
+        self.clear_btn = ttk.Button(draw_controls, text="Limpiar", command=self.clear_canvas)
+        self.clear_btn.pack(side="left", padx=5)
+
+        self.result_var_draw = tk.StringVar(value="Dibuja un número y presiona 'Predecir dibujo'")
+        self.result_label_draw = ttk.Label(self.frame_draw, textvariable=self.result_var_draw, font=("Arial", 14))
+        self.result_label_draw.pack(pady=5)
+
+        # Eventos de dibujo (mouse o táctil que emula mouse)
+        self.canvas.bind("<B1-Motion>", self.paint)
+        self.canvas.bind("<Button-1>", self.paint)
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # ---------- Cámara ----------
     def update_frame(self):
-        ret, frame = self.cap.read()
-        if not ret:
+        if not self.running:
             return
-        self.last_frame = frame.copy()
-        disp = frame.copy()
-        h, w = disp.shape[:2]
-        side = int(min(w, h) * 0.6)
-        x1 = (w - side)//2
-        y1 = (h - side)//2
-        x2 = x1 + side
-        y2 = y1 + side
-        self.roi_rect = (x1, y1, x2, y2)
-        cv2.rectangle(disp, (x1,y1), (x2,y2), (0,255,0), 2)
+        ret, frame = self.cap.read()
+        if ret:
+            self.last_frame = frame.copy()
+            disp = frame.copy()
 
-        # Convertir a QImage y mostrar
-        rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        bytes_per_line = ch * w
-        qimg = QtGui.QImage(rgb.data, w, h, bytes_per_line, QtGui.QImage.Format.Format_RGB888)
-        pix = QtGui.QPixmap.fromImage(qimg)
-        self.video_label.setPixmap(pix)
+            # definimos ROI centrado (cuadrado) según tamaño del frame
+            h, w = disp.shape[:2]
+            side = int(min(w, h) * 0.6)  # 60% del lado menor
+            x1 = (w - side)//2
+            y1 = (h - side)//2
+            x2 = x1 + side
+            y2 = y1 + side
+            self.roi_rect = (x1, y1, x2, y2)
 
-    def capture_and_predict(self):
+            # dibujar recuadro guía (verde)
+            cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            # convertir a RGB para Tkinter
+            frame_rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame_rgb)
+            imgtk = ImageTk.PhotoImage(image=img)
+            self.video_label.imgtk = imgtk
+            self.video_label.configure(image=imgtk)
+
+        self.root.after(15, self.update_frame)
+
+    def capture_and_predict_roi(self):
         if self.last_frame is None or self.roi_rect is None:
-            self.result_label.setText("No hay frame disponible aún.")
+            self.result_var_cam.set("No hay frame disponible aún.")
             return
         x1, y1, x2, y2 = self.roi_rect
         crop = self.last_frame[y1:y2, x1:x2]
@@ -250,123 +221,50 @@ class CameraTab(QtWidgets.QWidget):
         pred_idx = int(np.argmax(preds))
         prob = float(preds[pred_idx])
         msg = f"Es el número {CLASS_NAMES[pred_idx]} (prob: {prob:.2f})"
-        self.result_label.setText(msg)
+        self.result_var_cam.set(msg)
         speak(f"Es el número {CLASS_NAMES[pred_idx]}")
 
-    def close(self):
-        try:
-            self.cap.release()
-        except Exception:
-            pass
+    # ---------- Dibujo ----------
+    def paint(self, event):
+        r = self.brush // 2
+        x1, y1 = (event.x - r), (event.y - r)
+        x2, y2 = (event.x + r), (event.y + r)
+        # dibuja en el canvas visible
+        self.canvas.create_oval(x1, y1, x2, y2, fill="black", outline="black")
+        # dibuja en la imagen PIL (para preprocesado)
+        self.canvas_draw.ellipse([x1, y1, x2, y2], fill="black", outline="black")
 
-class DrawTab(QtWidgets.QWidget):
-    def __init__(self, model: tf.keras.Model, parent=None):
-        super().__init__(parent)
-        self.model = model
-        self.canvas = PaintCanvas(size=280, brush=20)
-        self.predict_btn = QtWidgets.QPushButton("Predecir dibujo")
-        self.predict_btn.setProperty("variant", "primary")
-        self.predict_btn.clicked.connect(self.predict_from_canvas)
-
-        self.clear_btn = QtWidgets.QPushButton("Limpiar")
-        self.clear_btn.setProperty("variant", "secondary")
-        self.clear_btn.clicked.connect(self.canvas.clear)
-
-        self.result_label = QtWidgets.QLabel("Dibuja un número y presiona Predecir")
-        self.result_label.setProperty("class", "lead")
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(self._make_card([self.canvas]))
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(self.predict_btn)
-        row.addWidget(self.clear_btn)
-        row.addStretch(1)
-        layout.addLayout(row)
-        layout.addWidget(self.result_label)
-
-    def _make_card(self, widgets: list[QtWidgets.QWidget]) -> QtWidgets.QFrame:
-        card = QtWidgets.QFrame()
-        card.setProperty("class", "card")
-        v = QtWidgets.QVBoxLayout(card)
-        for w in widgets:
-            v.addWidget(w)
-        return card
+    def clear_canvas(self):
+        self.canvas.delete("all")
+        self.canvas_draw.rectangle([0,0,self.canvas_size,self.canvas_size], fill="white")
+        self.result_var_draw.set("Lienzo limpio. Dibuja un número y presiona 'Predecir dibujo'.")
 
     def predict_from_canvas(self):
-        img28 = self.canvas.to_mnist_array()
+        img28 = preprocess_digit_pil(self.canvas_image)
         x = np.expand_dims(img28, axis=0)
         preds = self.model.predict(x, verbose=0)[0]
         pred_idx = int(np.argmax(preds))
         prob = float(preds[pred_idx])
         msg = f"Es el número {CLASS_NAMES[pred_idx]} (prob: {prob:.2f})"
-        self.result_label.setText(msg)
+        self.result_var_draw.set(msg)
         speak(f"Es el número {CLASS_NAMES[pred_idx]}")
 
-# ================== MAIN WINDOW ==================
-
-class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Reconocimiento de Dígitos - PyQt6 (estilo Bootstrap)")
-        self.resize(900, 700)
-
-        # Cargar/entrenar modelo
-        self.model = train_or_load_model()
-
-        # Tabs
-        tabs = QtWidgets.QTabWidget()
-        self.cam_tab = CameraTab(self.model)
-        self.draw_tab = DrawTab(self.model)
-        tabs.addTab(self.cam_tab, "Cámara")
-        tabs.addTab(self.draw_tab, "Dibujar")
-
-        # Contenedor central con padding (tipo container)
-        central = QtWidgets.QWidget()
-        outer = QtWidgets.QVBoxLayout(central)
-        outer.setContentsMargins(24, 24, 24, 24)
-        outer.addWidget(tabs)
-        self.setCentralWidget(central)
-
-        # Estilo tipo Bootstrap con QSS
-        self.setStyleSheet(self.bootstrap_like_qss())
-
-    def bootstrap_like_qss(self) -> str:
-        return """
-        QWidget { font-family: 'Segoe UI', 'Inter', Arial, sans-serif; font-size: 14px; color: #212529; }
-        QMainWindow { background: #f8f9fa; }
-        QTabWidget::pane { border: 1px solid #dee2e6; border-radius: 8px; background: #ffffff; }
-        QTabBar::tab { background: #e9ecef; border: 1px solid #dee2e6; padding: 8px 16px; margin-right: 4px; border-top-left-radius: 6px; border-top-right-radius: 6px; color: #212529; }
-        QTabBar::tab:selected { background: #ffffff; border-bottom-color: #ffffff; }
-
-        .card { background: #ffffff; border: 1px solid #dee2e6; border-radius: 12px; padding: 12px; }
-        QLabel.lead { color: #495057; font-size: 16px; }
-
-        QPushButton { border-radius: 10px; padding: 8px 14px; border: 1px solid transparent; background: #e9ecef; color: #212529; }
-        QPushButton:hover { filter: brightness(1.03); }
-        QPushButton:pressed { padding-top: 9px; padding-bottom: 7px; }
-
-        /* Variantes tipo Bootstrap usando dynamic property 'variant' */
-        QPushButton[variant="primary"] { background: #0d6efd; color: #ffffff; }
-        QPushButton[variant="primary"]:hover { background: #0b5ed7; }
-        QPushButton[variant="secondary"] { background: #6c757d; color: #ffffff; }
-        QPushButton[variant="secondary"]:hover { background: #5c636a; }
-        """
-
-    def closeEvent(self, event: QtGui.QCloseEvent):
+    # ---------- Cierre ----------
+    def on_close(self):
+        self.running = False
         try:
-            self.cam_tab.timer.stop()
-            self.cam_tab.close()
-        except Exception:
+            self.cap.release()
+        except:
             pass
-        return super().closeEvent(event)
+        self.root.destroy()
 
-# ================== ENTRYPOINT ==================
-
-def main():
-    app = QtWidgets.QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec())
+# ================== MAIN ==================
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    try:
+        ttk.Style(root).theme_use("clam")
+    except:
+        pass
+    app = DigitApp(root)
+    root.mainloop()
