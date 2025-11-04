@@ -1,0 +1,49 @@
+# ============================
+# Archivos y carpetas de entorno virtual
+# ============================
+venv/
+.env/
+.env.bak
+.env.local
+
+# ============================
+# Archivos de Python
+# ============================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ============================
+# Archivos de configuración del sistema
+# ============================
+.DS_Store
+Thumbs.db
+
+# ============================
+# Modelos y datos pesados
+# ============================
+*.keras
+*.h5
+*.pkl
+*.npz
+
+# ============================
+# Logs y temporales
+# ============================
+*.log
+*.tmp
+*.swp
+*.bak
+
+# ============================
+# IDEs y editores
+# ============================
+.vscode/
+.idea/
+*.code-workspace
+
+# ============================
+# Otros posibles archivos locales
+# ============================
+*.sqlite3
