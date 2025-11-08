@@ -17,6 +17,23 @@ EPOCHS     = 5
 IMG_SIZE   = 28
 CLASS_DIGITS = [str(i) for i in range(10)]  # 0..9
 
+# ================== HELPER: LISTAR CÁMARAS ==================
+def list_available_cameras(max_index=10):
+    """
+    Devuelve una lista de índices de cámaras disponibles [0, 1, 2, ...].
+    Prueba a abrir cada índice; si abre y lee un frame, se considera válida.
+    """
+    found = []
+    for i in range(max_index):
+        cap = cv2.VideoCapture(i)
+        ok = cap.isOpened()
+        if ok:
+            ret, _ = cap.read()
+            if ret:
+                found.append(i)
+        cap.release()
+    return found
+
 # ================== MODELO (CNN dígitos 0-9, entrenado con MNIST) ==================
 def build_digit_model():
     from tensorflow.keras import layers, models
@@ -68,31 +85,25 @@ def train_or_load_digit_model():
 
 # ================== PREPROCESADO ESTILO MNIST ==================
 def _mnist_like_from_gray(gray):
-    """Convierte un recorte gris (0-255, trazo oscuro) a (28,28,1) trazo claro centrado."""
     inv = 255 - gray
     _, bw = cv2.threshold(inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
     ys, xs = np.where(bw > 0)
     if len(xs) == 0 or len(ys) == 0:
         canvas = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.uint8)
         return np.expand_dims(canvas.astype(np.float32)/255.0, -1)
-
     x1, x2 = xs.min(), xs.max()
     y1, y2 = ys.min(), ys.max()
     crop = inv[y1:y2+1, x1:x2+1]
-
     h, w = crop.shape
     if h > w:
         new_h, new_w = 20, max(1, int(round(w * 20.0 / h)))
     else:
         new_w, new_h = 20, max(1, int(round(h * 20.0 / w)))
     crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
     canvas = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.uint8)
     y_off = (IMG_SIZE - crop.shape[0]) // 2
     x_off = (IMG_SIZE - crop.shape[1]) // 2
     canvas[y_off:y_off+crop.shape[0], x_off:x_off+crop.shape[1]] = crop
-
     ys_grid, xs_grid = np.mgrid[0:IMG_SIZE, 0:IMG_SIZE]
     m = canvas.astype(np.float32)
     msum = m.sum()
@@ -103,203 +114,64 @@ def _mnist_like_from_gray(gray):
         shift_y = int(round(IMG_SIZE//2 - cy))
         M = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
         canvas = cv2.warpAffine(canvas, M, (IMG_SIZE, IMG_SIZE), flags=cv2.INTER_LINEAR, borderValue=0)
-
     arr = (canvas.astype(np.float32) / 255.0)
     arr = np.expand_dims(arr, axis=-1)
     return arr
 
-# ================== UTIL: PROYECCIÓN Y SPLITS ==================
-def _vertical_projection_split(mask, parts_hint=None):
-    """
-    Divide un bloque ancho usando proyección vertical (suma por columnas).
-    Devuelve lista de (x1,x2) cortes. Si no encuentra valles claros, devuelve [0, W].
-    """
-    W = mask.shape[1]
-    colsum = mask.sum(axis=0).astype(np.float32)
-    # normalizar
-    if colsum.max() > 0:
-        colsum /= colsum.max()
-
-    # suavizar señal para valles más estables
-    k = max(3, W // 20 | 1)  # kernel impar
-    colsum_smooth = cv2.GaussianBlur(colsum.reshape(1,-1), (k,1), 0).ravel()
-
-    # umbral para valle (por debajo de 0.25 del pico)
-    thresh = 0.25
-    valleys = np.where(colsum_smooth < thresh)[0]
-
-    if len(valleys) == 0:
-        return [(0, W)]
-
-    # agrupar valles contiguos y tomar centro de cada grupo
-    splits = []
-    start = valleys[0]
-    for i in range(1, len(valleys)):
-        if valleys[i] != valleys[i-1] + 1:
-            mid = (start + valleys[i-1]) // 2
-            splits.append(mid)
-            start = valleys[i]
-    mid = (start + valleys[-1]) // 2
-    splits.append(mid)
-
-    # limitar a 1 o 2 cortes (→ 2 o 3 dígitos)
-    if parts_hint == 2 and len(splits) > 1:
-        # tomar el valle más profundo
-        depth = colsum_smooth[splits]
-        splits = [int(splits[np.argmin(depth)])]
-    elif parts_hint == 3 and len(splits) >= 2:
-        # tomar 2 valles más profundos
-        depth = colsum_smooth[splits]
-        idx = np.argsort(depth)[:2]
-        splits = sorted([int(splits[i]) for i in idx])
-    else:
-        # si no hay hint, máximo 2 cortes
-        if len(splits) > 2:
-            depth = colsum_smooth[splits]
-            idx = np.argsort(depth)[:2]
-            splits = sorted([int(splits[i]) for i in idx])
-
-    # construir rangos a partir de splits
-    ranges = []
-    last = 0
-    for s in splits:
-        if s - last > 3:
-            ranges.append((last, s))
-        last = s
-    if W - last > 3:
-        ranges.append((last, W))
-    if not ranges:
-        ranges = [(0, W)]
-    return ranges
-
-def _split_wide_box(gray, box, max_parts=3):
-    """
-    Si una caja es ancha (varios dígitos pegados), intenta dividirla en 2-3 partes.
-    """
-    x,y,w,h = box
-    crop = gray[y:y+h, x:x+w]
-    # umbral e inversión para proyección
-    _, bw = cv2.threshold(255 - crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    ranges = _vertical_projection_split(bw, parts_hint=None)
-    # limitar nr partes
-    if len(ranges) > max_parts:
-        ranges = ranges[:max_parts]
-    new_boxes = []
-    for (x1,x2) in ranges:
-        ww = x2 - x1
-        if ww < 4: 
-            continue
-        new_boxes.append((x + x1, y, ww, h))
-    return new_boxes if new_boxes else [box]
-
-# ================== SEGMENTACIÓN DE DÍGITOS ==================
-def segment_digits_from_gray(gray, max_digits=3):
-    """
-    Imagen gris (fondo blanco, trazo negro) -> lista de recortes por dígito ordenados izq→der.
-    Usa dilatación leve + contornos; divide automáticamente bloques anchos por proyección vertical.
-    """
-    # Suavizar y binarizar
-    blur = cv2.GaussianBlur(gray, (3,3), 0)
-    _, bw = cv2.threshold(255 - blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Unir trazos cercanos para evitar cortes raros
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
-    bw = cv2.dilate(bw, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes = []
-    H, W = gray.shape[:2]
-    for c in contours:
-        x,y,w,h = cv2.boundingRect(c)
-        area = w*h
-        if area < 80 or w < 3 or h < 6:
-            continue
-        # descartar marcos/extremos
-        if x <= 1 or y <= 1 or x+w >= W-1 or y+h >= H-1:
-            pass
-        boxes.append((x,y,w,h))
-
-    if not boxes:
-        return []
-
-    # Orden inicial por X
-    boxes.sort(key=lambda b: b[0])
-
-    # Intento de split en cajas demasiado anchas
-    refined = []
-    for b in boxes:
-        x,y,w,h = b
-        aspect = w / float(max(h,1))
-        if aspect > 0.9*max_digits:  # muy ancho para un dígito
-            refined.extend(_split_wide_box(gray, b, max_parts=max_digits))
-        elif aspect > 1.7:  # heurística: probablemente 2 dígitos
-            refined.extend(_split_wide_box(gray, b, max_parts=2))
-        else:
-            refined.append(b)
-
-    # Si aún queda una sola caja muy ancha y esperamos múltiples dígitos, dividirla
-    if len(refined) == 1 and max_digits > 1:
-        x,y,w,h = refined[0]
-        aspect = w / float(max(h,1))
-        if aspect > 1.6:
-            refined = _split_wide_box(gray, refined[0], max_parts=max_digits)
-
-    # Orden final por X y recortes con padding
-    refined.sort(key=lambda b: b[0])
-    crops = []
-    for (x,y,w,h) in refined[:max_digits]:
-        pad = max(2, int(0.15*max(w,h)))
-        x1 = max(0, x - pad); y1 = max(0, y - pad)
-        x2 = min(gray.shape[1], x + w + pad); y2 = min(gray.shape[0], y + h + pad)
-        crops.append(gray[y1:y2, x1:x2])
-    return crops
-
-# ================== PREDICCIÓN CON TTA ==================
+# ================== PREDICCIÓN ==================
 def _predict_digit_with_tta(model, gray_crop):
-    """
-    TTA: pequeñas traslaciones (-1,0,+1) en x/y. Se promedia la probabilidad.
-    """
     shifts = [(-1,0),(1,0),(0,-1),(0,1),(0,0)]
     probs = []
     for dx,dy in shifts:
-        # trasladar el recorte suavemente en canvas 28x28
-        arr = _mnist_like_from_gray(gray_crop)[...,0]  # (28,28)
+        arr = _mnist_like_from_gray(gray_crop)[...,0]
         M = np.float32([[1,0,dx],[0,1,dy]])
         shifted = cv2.warpAffine((arr*255).astype(np.uint8), M, (IMG_SIZE,IMG_SIZE),
                                  flags=cv2.INTER_LINEAR, borderValue=0).astype(np.float32)/255.0
-        x = np.expand_dims(shifted, axis=(0,-1))  # (1,28,28,1)
+        x = np.expand_dims(shifted, axis=(0,-1))
         p = model.predict(x, verbose=0)[0]
         probs.append(p)
     probs = np.mean(probs, axis=0)
     idx = int(np.argmax(probs))
     return idx, float(probs[idx]), probs
 
+def segment_digits_from_gray(gray, max_digits=3):
+    blur = cv2.GaussianBlur(gray, (3,3), 0)
+    _, bw = cv2.threshold(255 - blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    bw = cv2.dilate(bw, kernel, iterations=1)
+    contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    H, W = gray.shape[:2]
+    for c in contours:
+        x,y,w,h = cv2.boundingRect(c)
+        if w*h < 80 or w < 3 or h < 6:
+            continue
+        boxes.append((x,y,w,h))
+    boxes.sort(key=lambda b: b[0])
+    crops = []
+    for (x,y,w,h) in boxes[:max_digits]:
+        pad = max(2, int(0.15*max(w,h)))
+        x1 = max(0, x - pad); y1 = max(0, y - pad)
+        x2 = min(gray.shape[1], x + w + pad); y2 = min(gray.shape[0], y + h + pad)
+        crops.append(gray[y1:y2, x1:x2])
+    return crops
+
 def predict_number_from_gray(gray, model):
-    """
-    Segmenta 1–3 dígitos, predice cada uno con TTA y concatena.
-    Devuelve (numero_predicho:int o None, detalle_texto).
-    """
     digit_crops = segment_digits_from_gray(gray, max_digits=3)
     if not digit_crops:
         return None, "No se detectaron dígitos."
-
     preds_str, confs = [], []
     for crop in digit_crops:
         idx, conf, _ = _predict_digit_with_tta(model, crop)
         preds_str.append(CLASS_DIGITS[idx])
         confs.append(conf)
-
     number_str = "".join(preds_str)
-    # normalizar 0..100 (quitar ceros a la izquierda)
     try:
         value = int(number_str.lstrip('0') or '0')
     except:
         return None, f"Predicción no válida: {number_str}"
-
     if value > 100:
-        # Si se pasó, intenta dividir en más partes (ya limitado a 3) o reporta
         return None, f"{number_str} fuera de rango (0–100)."
-
     detail = " + ".join([f"{d} ({c:.2f})" for d,c in zip(preds_str, confs)]) + f"  →  Número: {value}"
     return value, detail
 
@@ -308,14 +180,14 @@ def speak(text):
         engine = pyttsx3.init()
         engine.say(text)
         engine.runAndWait()
-    except Exception as e:
-        print(f"[TTS] No se pudo reproducir voz: {e}")
+    except:
+        pass
 
 # ================== APP ==================
 class DigitApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Reconocimiento de Números 0–100 (segmentación + TTA)")
+        self.root.title("Reconocimiento de Números 0–100")
         self.model = train_or_load_digit_model()
 
         self.notebook = ttk.Notebook(root)
@@ -326,28 +198,43 @@ class DigitApp:
         self.notebook.pack(fill="both", expand=True)
 
         # ---------- Cámara ----------
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            raise RuntimeError("No se pudo abrir la cámara (VideoCapture(0)).")
+        self.cap = None
+
+        # Controles arriba del video
+        top_controls = ttk.Frame(self.frame_cam)
+        top_controls.pack(padx=10, pady=(10,0), fill="x")
+
+        ttk.Label(top_controls, text="Cámara:").pack(side="left", padx=(0,5))
+        self.cam_combo = ttk.Combobox(top_controls, state="readonly", width=10)
+        self.cam_combo.pack(side="left", padx=5)
+        self.refresh_cams_btn = ttk.Button(top_controls, text="Actualizar", command=self._scan_cameras_ui)
+        self.refresh_cams_btn.pack(side="left", padx=5)
+        self.connect_cam_btn = ttk.Button(top_controls, text="Conectar", command=self._connect_selected_camera)
+        self.connect_cam_btn.pack(side="left", padx=5)
+
+        # Espacio del video
         self.video_label = tk.Label(self.frame_cam)
-        self.video_label.pack(padx=10, pady=10)
+        self.video_label.pack(padx=10, pady=(10,10))
 
-        cam_controls = ttk.Frame(self.frame_cam)
-        cam_controls.pack(padx=10, pady=5, fill="x")
-        self.capture_btn = ttk.Button(cam_controls, text="Capturar (ROI)", command=self.capture_and_predict_roi)
-        self.capture_btn.pack(side="left", padx=5)
+        # Botón de captura debajo del video
+        bottom_controls = ttk.Frame(self.frame_cam)
+        bottom_controls.pack(padx=10, pady=(0,10))
+        self.capture_btn = ttk.Button(bottom_controls, text="Capturar (ROI)", command=self.capture_and_predict_roi)
+        self.capture_btn.pack(anchor="center")
 
-        self.result_var_cam = tk.StringVar(value="Esperando captura...")
+        # Resultado
+        self.result_var_cam = tk.StringVar(value="Selecciona una cámara y pulsa 'Conectar'.")
         self.result_label_cam = ttk.Label(self.frame_cam, textvariable=self.result_var_cam, font=("Arial", 14))
-        self.result_label_cam.pack(pady=5)
+        self.result_label_cam.pack(pady=(0,10))
 
         self.running = True
         self.last_frame = None
         self.roi_rect = None
+        self._scan_cameras_ui(auto_connect=True)
         self.update_frame()
 
-        # ---------- Lienzo ----------
-        self.canvas_size = 280
+        # ---------- Dibujo ----------
+        self.canvas_size = 360
         self.brush = 20
         self.canvas = tk.Canvas(self.frame_draw, width=self.canvas_size, height=self.canvas_size, bg="white", cursor="pencil")
         self.canvas.pack(padx=10, pady=10)
@@ -366,7 +253,6 @@ class DigitApp:
         self.result_label_draw = ttk.Label(self.frame_draw, textvariable=self.result_var_draw, font=("Arial", 14))
         self.result_label_draw.pack(pady=5)
 
-        # Dibujo suave
         self.last_pt = None
         self.canvas.bind("<Button-1>", self._start_stroke)
         self.canvas.bind("<B1-Motion>", self._draw_stroke)
@@ -375,35 +261,65 @@ class DigitApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ---------- Cámara ----------
+    def _scan_cameras_ui(self, auto_connect=False):
+        cams = list_available_cameras(max_index=10)
+        if not cams:
+            self.cam_combo['values'] = []
+            self.cam_combo.set("")
+            self.result_var_cam.set("No se detectaron cámaras.")
+            return
+        self.cam_combo['values'] = [str(i) for i in cams]
+        self.cam_combo.current(0)
+        if auto_connect:
+            self._connect_selected_camera()
+
+    def _connect_selected_camera(self):
+        sel = self.cam_combo.get()
+        if not sel:
+            self.result_var_cam.set("Selecciona una cámara.")
+            return
+        idx = int(sel)
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except:
+                pass
+        self.cap = cv2.VideoCapture(idx)
+        if not self.cap.isOpened():
+            self.result_var_cam.set(f"No se pudo abrir la cámara {idx}.")
+            self.cap = None
+            return
+        self.result_var_cam.set(f"Cámara {idx} conectada.")
+
     def update_frame(self):
         if not self.running:
             return
-        ret, frame = self.cap.read()
-        if ret:
-            self.last_frame = frame.copy()
-            disp = frame.copy()
-
-            # ROI centrado
-            h, w = disp.shape[:2]
-            side = int(min(w, h) * 0.6)
-            x1 = (w - side)//2
-            y1 = (h - side)//2
-            x2 = x1 + side
-            y2 = y1 + side
-            self.roi_rect = (x1, y1, x2, y2)
-            cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-            frame_rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(frame_rgb)
-            imgtk = ImageTk.PhotoImage(image=img)
-            self.video_label.imgtk = imgtk
-            self.video_label.configure(image=imgtk)
-
+        if self.cap is not None and self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if ret:
+                self.last_frame = frame.copy()
+                disp = frame.copy()
+                h, w = disp.shape[:2]
+                side = int(min(w, h) * 0.6)
+                x1 = (w - side)//2
+                y1 = (h - side)//2
+                x2 = x1 + side
+                y2 = y1 + side
+                self.roi_rect = (x1, y1, x2, y2)
+                cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                frame_rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(frame_rgb)
+                imgtk = ImageTk.PhotoImage(image=img)
+                self.video_label.imgtk = imgtk
+                self.video_label.configure(image=imgtk)
         self.root.after(15, self.update_frame)
 
     def capture_and_predict_roi(self):
+        if self.cap is None or not self.cap.isOpened():
+            self.result_var_cam.set("Sin cámara activa.")
+            return
         if self.last_frame is None or self.roi_rect is None:
-            self.result_var_cam.set("No hay frame disponible aún.")
+            self.result_var_cam.set("No hay imagen disponible.")
             return
         x1, y1, x2, y2 = self.roi_rect
         crop_bgr = self.last_frame[y1:y2, x1:x2]
@@ -416,35 +332,25 @@ class DigitApp:
             speak(f"Es el número {value}")
 
     # ---------- Dibujo ----------
-    def _start_stroke(self, event):
-        self.last_pt = (event.x, event.y)
-
+    def _start_stroke(self, event): self.last_pt = (event.x, event.y)
     def _draw_stroke(self, event):
-        if self.last_pt is None:
+        if self.last_pt:
+            x0, y0 = self.last_pt
+            self.canvas.create_line(x0, y0, event.x, event.y,
+                                    width=self.brush, fill="black",
+                                    capstyle=tk.ROUND, smooth=True)
+            self.canvas_draw.line([x0, y0, event.x, event.y],
+                                  fill="black", width=self.brush)
             self.last_pt = (event.x, event.y)
-        x0, y0 = self.last_pt
-        x1, y1 = event.x, event.y
-        self.canvas.create_line(x0, y0, x1, y1,
-                                width=self.brush, fill="black",
-                                capstyle=tk.ROUND, smooth=True)
-        self.canvas_draw.line([x0, y0, x1, y1],
-                              fill="black", width=self.brush, joint="curve")
-        self.last_pt = (x1, y1)
-
-    def _end_stroke(self, event):
-        self.last_pt = None
-
+    def _end_stroke(self, event): self.last_pt = None
     def clear_canvas(self):
         self.canvas.delete("all")
         self.canvas_draw.rectangle([0,0,self.canvas_size,self.canvas_size], fill="white")
-        self.result_var_draw.set("Lienzo limpio. Escribe un número (0–100) y presiona 'Predecir dibujo'.")
-
+        self.result_var_draw.set("Lienzo limpio.")
     def predict_from_canvas(self):
-        img = self.canvas_image.convert("L")
-        gray = np.array(img)
+        gray = np.array(self.canvas_image.convert("L"))
         value, detail = predict_number_from_gray(gray, self.model)
-        if value is None:
-            self.result_var_draw.set(detail)
+        if value is None: self.result_var_draw.set(detail)
         else:
             self.result_var_draw.set(detail)
             speak(f"Es el número {value}")
@@ -453,9 +359,8 @@ class DigitApp:
     def on_close(self):
         self.running = False
         try:
-            self.cap.release()
-        except:
-            pass
+            if self.cap: self.cap.release()
+        except: pass
         self.root.destroy()
 
 # ================== MAIN ==================
