@@ -1,4 +1,4 @@
-# Reconocimiento de Números 0–100 (MNIST + Segmentación + TTA)
+# Reconocimiento de Números 
 
 Aplicación de escritorio (Tkinter) que:
 - Entrena o carga una CNN (Keras/TensorFlow) para reconocer **dígitos 0–9** con MNIST.
